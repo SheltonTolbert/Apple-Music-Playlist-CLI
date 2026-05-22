@@ -19,6 +19,8 @@ usage() {
 	printf '%s\n' "  playlist rename <old-name> <new-name>"
 	printf '%s\n' "  playlist delete <name> --force"
 	printf '%s\n' "  playlist add <playlist-name> <track-name>"
+	printf '%s\n' "  playlist add-catalog <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
+	printf '%s\n' "  playlist search <track-name> <artist-name>"
 	printf '%s\n' "  playlist remove <playlist-name> <track-name> --force"
 	printf '%s\n' "  playlist clear <name> --force"
 }
@@ -34,6 +36,10 @@ playlist_usage() {
 	printf '%s\n' "  delete <name> --force        Delete a playlist"
 	printf '%s\n' "  add <playlist-name> <track-name>"
 	printf '%s\n' "                               Add a track to a playlist"
+	printf '%s\n' "  add-catalog <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
+	printf '%s\n' "                               Add an Apple Music catalog track to a cloud playlist"
+	printf '%s\n' "  search <track-name> <artist-name>"
+	printf '%s\n' "                               Search Apple Music catalog matches"
 	printf '%s\n' "  remove <playlist-name> <track-name> --force"
 	printf '%s\n' "                               Remove a track from a playlist"
 	printf '%s\n' "  clear <name> --force         Remove all tracks from a playlist"
@@ -60,6 +66,12 @@ playlist_command_usage() {
 			;;
 		add)
 			printf '%s\n' "Usage: ${program_name} playlist add <playlist-name> <track-name>"
+			;;
+		add-catalog|add-streaming)
+			printf '%s\n' "Usage: ${program_name} playlist ${command} <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
+			;;
+		search)
+			printf '%s\n' "Usage: ${program_name} playlist search <track-name> <artist-name>"
 			;;
 		remove)
 			printf '%s\n' "Usage: ${program_name} playlist remove <playlist-name> <track-name> --force"
@@ -158,6 +170,17 @@ require_non_empty_track_name() {
 	fi
 }
 
+require_non_empty_artist_name() {
+	local usage_scope="${1}"
+	local label="${2}"
+	local value="${3:-}"
+
+	if [[ -z "${value}" ]]; then
+		usage_error "${label} requires a non-empty artist name." "${usage_scope}"
+		return $?
+	fi
+}
+
 require_command() {
 	local command_name="${1}"
 
@@ -165,6 +188,158 @@ require_command() {
 		print_error "Required command not found: ${command_name}"
 		return "${EX_UNAVAILABLE}"
 	fi
+}
+
+url_encode() {
+	require_command "jq" || return $?
+	command jq -rn --arg value "${1}" '$value | @uri'
+}
+
+require_catalog_tools() {
+	require_command "curl" || return $?
+	require_command "jq" || return $?
+}
+
+require_apple_music_api_tokens() {
+	if [[ -z "${APPLE_MUSIC_DEVELOPER_TOKEN:-}" ]]; then
+		print_error "APPLE_MUSIC_DEVELOPER_TOKEN is required for Apple Music catalog playlist writes."
+		return "${EX_USAGE}"
+	fi
+
+	if [[ -z "${APPLE_MUSIC_USER_TOKEN:-}" ]]; then
+		print_error "APPLE_MUSIC_USER_TOKEN is required for Apple Music catalog playlist writes."
+		return "${EX_USAGE}"
+	fi
+}
+
+itunes_search_url() {
+	local track_name="${1}"
+	local artist_name="${2}"
+	local storefront="${APPLE_MUSIC_ITUNES_COUNTRY:-US}"
+	local encoded_query
+
+	encoded_query="$(url_encode "${track_name} ${artist_name}")" || return $?
+	printf 'https://itunes.apple.com/search?term=%s&country=%s&media=music&entity=song&limit=10\n' "${encoded_query}" "${storefront}"
+}
+
+catalog_search_response() {
+	local track_name="${1}"
+	local artist_name="${2}"
+	local search_url
+
+	require_catalog_tools || return $?
+	search_url="$(itunes_search_url "${track_name}" "${artist_name}")" || return $?
+	command curl -fsS "${search_url}"
+}
+
+catalog_matches_json() {
+	local track_name="${1}"
+	local artist_name="${2}"
+	local response="${3}"
+
+	printf '%s' "${response}" | command jq -c \
+		--arg track_name "${track_name}" \
+		--arg artist_name "${artist_name}" \
+		'[
+			.results[]?
+			| select(.wrapperType == "track" and .kind == "song")
+			| select((.trackName // "" | ascii_downcase) == ($track_name | ascii_downcase))
+			| select((.artistName // "" | ascii_downcase) == ($artist_name | ascii_downcase))
+			| select(.isStreamable == true)
+		]'
+}
+
+catalog_match_tsv() {
+	local track_name="${1}"
+	local artist_name="${2}"
+	local response="${3}"
+	local selected_track_id="${4:-}"
+	local matches
+	local match_count
+	local selected_match
+
+	matches="$(catalog_matches_json "${track_name}" "${artist_name}" "${response}")" || return $?
+	match_count="$(printf '%s' "${matches}" | command jq 'length')" || return $?
+
+	if (( match_count == 0 )); then
+		print_error "No streamable Apple Music catalog match found for: ${track_name} by ${artist_name}"
+		return "${EX_USAGE}"
+	fi
+
+	if [[ -n "${selected_track_id}" ]]; then
+		selected_match="$(printf '%s' "${matches}" | command jq -r \
+			--arg selected_track_id "${selected_track_id}" \
+			'map(select((.trackId | tostring) == $selected_track_id)) | if length == 0 then empty else .[0] | [.trackId, .trackName, .artistName, .collectionName, .trackViewUrl] | @tsv end')" || return $?
+
+		if [[ -z "${selected_match}" ]]; then
+			print_error "Track ID ${selected_track_id} did not match ${track_name} by ${artist_name} in the catalog search results."
+			return "${EX_USAGE}"
+		fi
+
+		printf '%s\n' "${selected_match}"
+		return 0
+	fi
+
+	printf '%s' "${matches}" | command jq -r '.[0] | [.trackId, .trackName, .artistName, .collectionName, .trackViewUrl] | @tsv'
+}
+
+apple_music_api_get() {
+	local path="${1}"
+
+	require_catalog_tools || return $?
+	require_apple_music_api_tokens || return $?
+	command curl -fsS \
+		-H "Authorization: Bearer ${APPLE_MUSIC_DEVELOPER_TOKEN}" \
+		-H "Music-User-Token: ${APPLE_MUSIC_USER_TOKEN}" \
+		"https://api.music.apple.com${path}"
+}
+
+apple_music_api_post_json() {
+	local path="${1}"
+	local body="${2}"
+
+	require_catalog_tools || return $?
+	require_apple_music_api_tokens || return $?
+	command curl -fsS \
+		-X POST \
+		-H "Authorization: Bearer ${APPLE_MUSIC_DEVELOPER_TOKEN}" \
+		-H "Music-User-Token: ${APPLE_MUSIC_USER_TOKEN}" \
+		-H "Content-Type: application/json" \
+		-d "${body}" \
+		"https://api.music.apple.com${path}"
+}
+
+resolve_cloud_playlist_id() {
+	local playlist_name="${1}"
+	local path="/v1/me/library/playlists?limit=100"
+	local response
+	local page_ids
+	local next_path
+	local -a matches=()
+
+	while [[ -n "${path}" ]]; do
+		response="$(apple_music_api_get "${path}")" || return $?
+		page_ids=("${(@f)$(printf '%s' "${response}" | command jq -r --arg playlist_name "${playlist_name}" '.data[]? | select(.attributes.name == $playlist_name) | .id')}")
+
+		if (( ${#page_ids[@]} > 0 )); then
+			matches+=("${page_ids[@]}")
+		fi
+
+		next_path="$(printf '%s' "${response}" | command jq -r '.next // empty')" || return $?
+		path="${next_path}"
+	done
+
+	if (( ${#matches[@]} == 0 )); then
+		print_error "Cloud library playlist not found through Apple Music API: ${playlist_name}"
+		return "${EX_USAGE}"
+	fi
+
+	if (( ${#matches[@]} > 1 )); then
+		print_error "Cloud library playlist name is ambiguous through Apple Music API: ${playlist_name}"
+		return "${EX_USAGE}"
+	fi
+
+	printf '%s\n' "${matches[1]}"
 }
 
 run_applescript() {
@@ -498,6 +673,112 @@ playlist_add() {
 		-- "$1" "$2"
 }
 
+playlist_search() {
+	local response
+	local matches
+
+	if wants_help "$@"; then
+		playlist_command_usage "search"
+		return 0
+	fi
+
+	require_arg_count "playlist:search" "playlist search" 2 "$@" || return $?
+	require_non_empty_track_name "playlist:search" "playlist search" "${1}" || return $?
+	require_non_empty_artist_name "playlist:search" "playlist search" "${2}" || return $?
+
+	response="$(catalog_search_response "${1}" "${2}")" || return $?
+	matches="$(catalog_matches_json "${1}" "${2}" "${response}")" || return $?
+
+	if (( $(printf '%s' "${matches}" | command jq 'length') == 0 )); then
+		print_error "No streamable Apple Music catalog match found for: ${1} by ${2}"
+		return "${EX_USAGE}"
+	fi
+
+	printf '%s\n' "Apple Music catalog matches:"
+	printf '%s' "${matches}" | command jq -r \
+		'.[] | "- \(.trackName) by \(.artistName) | \(.collectionName) | id:\(.trackId) | \(.trackViewUrl)"'
+}
+
+playlist_add_catalog() {
+	local playlist_name="${1:-}"
+	local requested_track_name="${2:-}"
+	local requested_artist_name="${3:-}"
+	local dry_run="false"
+	local selected_track_id=""
+	local response
+	local match_tsv
+	local track_id
+	local track_name
+	local artist_name
+	local collection_name
+	local track_url
+	local cloud_playlist_id
+	local request_body
+
+	if wants_help "$@"; then
+		playlist_command_usage "add-catalog"
+		return 0
+	fi
+
+	if (( $# < 3 )); then
+		usage_error "playlist add-catalog expects at least 3 argument(s), got $#." "playlist:add-catalog"
+		return $?
+	fi
+
+	if (( $# > 6 )); then
+		usage_error "playlist add-catalog expects at most 6 argument(s), got $#." "playlist:add-catalog"
+		return $?
+	fi
+
+	shift 3
+	while (( $# > 0 )); do
+		case "${1}" in
+			--dry-run)
+				dry_run="true"
+				shift
+				;;
+			--track-id)
+				if (( $# < 2 )); then
+					usage_error "playlist add-catalog --track-id requires a value." "playlist:add-catalog"
+					return $?
+				fi
+				selected_track_id="${2}"
+				shift 2
+				;;
+			*)
+				usage_error "Unknown playlist add-catalog option: ${1}" "playlist:add-catalog"
+				return $?
+				;;
+		esac
+	done
+
+	require_non_empty_name "playlist:add-catalog" "playlist add-catalog" "${playlist_name}" || return $?
+	require_non_empty_track_name "playlist:add-catalog" "playlist add-catalog" "${requested_track_name}" || return $?
+	require_non_empty_artist_name "playlist:add-catalog" "playlist add-catalog" "${requested_artist_name}" || return $?
+	if [[ -n "${selected_track_id}" && "${selected_track_id}" != <-> ]]; then
+		usage_error "playlist add-catalog --track-id must be numeric." "playlist:add-catalog"
+		return $?
+	fi
+
+	response="$(catalog_search_response "${requested_track_name}" "${requested_artist_name}")" || return $?
+	match_tsv="$(catalog_match_tsv "${requested_track_name}" "${requested_artist_name}" "${response}" "${selected_track_id}")" || return $?
+
+	IFS=$'\t' read -r track_id track_name artist_name collection_name track_url <<< "${match_tsv}"
+
+	if [[ "${dry_run}" == "true" ]]; then
+		printf '%s\n' "Catalog match: ${track_name} by ${artist_name} | ${collection_name} | id:${track_id}"
+		printf '%s\n' "Would add to cloud playlist: ${playlist_name}"
+		printf '%s\n' "${track_url}"
+		return 0
+	fi
+
+	require_apple_music_api_tokens || return $?
+	cloud_playlist_id="$(resolve_cloud_playlist_id "${playlist_name}")" || return $?
+	request_body="$(command jq -nc --arg track_id "${track_id}" '{data: [{id: $track_id, type: "songs"}]}')" || return $?
+	apple_music_api_post_json "/v1/me/library/playlists/${cloud_playlist_id}/tracks" "${request_body}" >/dev/null || return $?
+	printf '%s\n' "Added catalog track: ${track_name} by ${artist_name} -> ${playlist_name}"
+}
+
 playlist_remove() {
 	if wants_help "$@"; then
 		playlist_command_usage "remove"
@@ -585,6 +866,14 @@ playlist() {
 		add)
 			shift
 			playlist_add "$@"
+			;;
+		add-catalog|add-streaming)
+			shift
+			playlist_add_catalog "$@"
+			;;
+		search)
+			shift
+			playlist_search "$@"
 			;;
 		remove)
 			shift
