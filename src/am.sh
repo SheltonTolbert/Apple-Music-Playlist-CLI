@@ -270,6 +270,20 @@ catalog_match_tsv() {
 	local match_count
 	local selected_match
 
+	if [[ -n "${selected_track_id}" ]]; then
+		selected_match="$(command curl -fsS "https://itunes.apple.com/lookup?id=${selected_track_id}&country=${APPLE_MUSIC_ITUNES_COUNTRY:-US}&entity=song" | command jq -r '
+			.results[]?
+			| select(.wrapperType == "track" and .kind == "song")
+			| select((.trackId | tostring) == "'"${selected_track_id}"'")
+			| [.trackId, .trackName, .artistName, .collectionName, .trackViewUrl]
+			| @tsv
+		')" || return $?
+		if [[ -n "${selected_match}" ]]; then
+			printf '%s\n' "${selected_match}"
+			return 0
+		fi
+	fi
+
 	matches="$(catalog_matches_json "${track_name}" "${artist_name}" "${response}")" || return $?
 	match_count="$(printf '%s' "${matches}" | command jq 'length')" || return $?
 
@@ -806,10 +820,8 @@ open_catalog_track_in_music() {
 	run_applescript "opening catalog track in Music.app" \
 		'on run argv' \
 		'	set trackUrl to item 1 of argv' \
-		'	tell application "Music"' \
-		'		activate' \
-		'		open location trackUrl' \
-		'	end tell' \
+		'	do shell script "open -a Music " & quoted form of trackUrl' \
+		'	tell application "Music" to activate' \
 		'end run' \
 		-- "$1"
 }
@@ -830,7 +842,7 @@ verify_playlist_track_name() {
 }
 
 click_music_add_button() {
-	run_applescript "clicking Music.app Add button" \
+	run_applescript "clicking Music.app Add/Download button" \
 		'on clickFirstAdd(rootElement)' \
 		'	tell application "System Events"' \
 		'		try' \
@@ -840,9 +852,16 @@ click_music_add_button() {
 		'		end try' \
 		'		repeat with childElement in childElements' \
 		'			try' \
-		'				set elementName to name of childElement as text' \
+		'				set elementName to ""' \
+		'				set elementDescription to ""' \
 		'				set elementRole to role description of childElement as text' \
-		'				if elementName is "Add" and elementRole is "button" then' \
+		'				try' \
+		'					set elementName to name of childElement as text' \
+		'				end try' \
+		'				try' \
+		'					set elementDescription to description of childElement as text' \
+		'				end try' \
+		'				if elementRole is "button" and (elementName is "Add" or elementName is "Add button" or elementDescription is "Add" or elementDescription is "Add button" or elementDescription is "Download button") then' \
 		'					click childElement' \
 		'					return true' \
 		'				end if' \
@@ -857,8 +876,8 @@ click_music_add_button() {
 		'	set waitSeconds to item 2 of argv as number' \
 		'	tell application "Music"' \
 		'		activate' \
-		'		open location trackUrl' \
 		'	end tell' \
+		'	do shell script "open -a Music " & quoted form of trackUrl' \
 		'	delay waitSeconds' \
 		'	tell application "System Events"' \
 		'		if UI elements enabled is false then' \
@@ -866,10 +885,16 @@ click_music_add_button() {
 		'		end if' \
 		'		tell process "Music"' \
 		'			set frontmost to true' \
-		'			if my clickFirstAdd(window 1) then return "Clicked Music.app Add button"' \
+		'			repeat with attemptNumber from 1 to 10' \
+		'				if (count of windows) > 0 then exit repeat' \
+		'				keystroke "0" using command down' \
+		'				delay 1' \
+		'			end repeat' \
+		'			if (count of windows) = 0 then error "Music.app has no open window; use Window > Music or Cmd-0, then retry." number 64' \
+		'			if my clickFirstAdd(window 1) then return "Clicked Music.app Add/Download button"' \
 		'		end tell' \
 		'	end tell' \
-		'	error "Could not find a visible Add button for the opened Apple Music catalog page." number 64' \
+		'	error "Could not find a visible Add/Download button for the opened Apple Music catalog page." number 64' \
 		'end run' \
 		-- "$1" "$2"
 }

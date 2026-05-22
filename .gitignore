@@ -1,1 +1,11 @@
 .DS_Store
+__pycache__/
+*.pyc
+
+# One-off playlist import artifacts
+import_*.py
+retry_*_direct.py
+import-*-results.tsv
+import-*-errors.tsv
+import-*-exact-missing.tsv
+import-*-direct-retries.tsv
