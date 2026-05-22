@@ -20,6 +20,7 @@ usage() {
 	printf '%s\n' "  playlist delete <name> --force"
 	printf '%s\n' "  playlist add <playlist-name> <track-name>"
 	printf '%s\n' "  playlist add-catalog <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
+	printf '%s\n' "  playlist add-gui <playlist-name> <track-name> <artist-name> [--track-id <id>] [--wait <seconds>] [--manual] [--dry-run]"
 	printf '%s\n' "  playlist search <track-name> <artist-name>"
 	printf '%s\n' "  playlist remove <playlist-name> <track-name> --force"
 	printf '%s\n' "  playlist clear <name> --force"
@@ -38,6 +39,8 @@ playlist_usage() {
 	printf '%s\n' "                               Add a track to a playlist"
 	printf '%s\n' "  add-catalog <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
 	printf '%s\n' "                               Add an Apple Music catalog track to a cloud playlist"
+	printf '%s\n' "  add-gui <playlist-name> <track-name> <artist-name> [--track-id <id>] [--wait <seconds>] [--manual] [--dry-run]"
+	printf '%s\n' "                               Add a catalog track through Music.app UI automation"
 	printf '%s\n' "  search <track-name> <artist-name>"
 	printf '%s\n' "                               Search Apple Music catalog matches"
 	printf '%s\n' "  remove <playlist-name> <track-name> --force"
@@ -69,6 +72,9 @@ playlist_command_usage() {
 			;;
 		add-catalog|add-streaming)
 			printf '%s\n' "Usage: ${program_name} playlist ${command} <playlist-name> <track-name> <artist-name> [--track-id <id>] [--dry-run]"
+			;;
+		add-gui)
+			printf '%s\n' "Usage: ${program_name} playlist add-gui <playlist-name> <track-name> <artist-name> [--track-id <id>] [--wait <seconds>] [--manual] [--dry-run]"
 			;;
 		search)
 			printf '%s\n' "Usage: ${program_name} playlist search <track-name> <artist-name>"
@@ -187,6 +193,12 @@ require_command() {
 	if ! command -v "${command_name}" >/dev/null 2>&1; then
 		print_error "Required command not found: ${command_name}"
 		return "${EX_UNAVAILABLE}"
+	fi
+}
+
+copy_to_clipboard() {
+	if command -v pbcopy >/dev/null 2>&1; then
+		printf '%s' "${1}" | pbcopy
 	fi
 }
 
@@ -779,6 +791,250 @@ playlist_add_catalog() {
 	printf '%s\n' "Added catalog track: ${track_name} by ${artist_name} -> ${playlist_name}"
 }
 
+ensure_mutable_playlist() {
+	run_applescript "checking playlist mutability" \
+		"${playlist_apple_script_helpers[@]}" \
+		'on run argv' \
+		'	set playlistName to item 1 of argv' \
+		'	set playlistRef to my exactly_one_mutable_playlist(playlistName)' \
+		'	return name of playlistRef as text' \
+		'end run' \
+		-- "$1" >/dev/null
+}
+
+open_catalog_track_in_music() {
+	run_applescript "opening catalog track in Music.app" \
+		'on run argv' \
+		'	set trackUrl to item 1 of argv' \
+		'	tell application "Music"' \
+		'		activate' \
+		'		open location trackUrl' \
+		'	end tell' \
+		'end run' \
+		-- "$1"
+}
+
+verify_playlist_track_name() {
+	run_applescript "verifying playlist track" \
+		"${playlist_apple_script_helpers[@]}" \
+		'on run argv' \
+		'	set playlistName to item 1 of argv' \
+		'	set trackName to item 2 of argv' \
+		'	set playlistRef to my exactly_one_playlist(playlistName)' \
+		'	tell application "Music"' \
+		'		set matchedTracks to every track of playlistRef whose name is trackName' \
+		'		return count of matchedTracks' \
+		'	end tell' \
+		'end run' \
+		-- "$1" "$2"
+}
+
+click_music_add_button() {
+	run_applescript "clicking Music.app Add button" \
+		'on clickFirstAdd(rootElement)' \
+		'	tell application "System Events"' \
+		'		try' \
+		'			set childElements to UI elements of rootElement' \
+		'		on error' \
+		'			set childElements to {}' \
+		'		end try' \
+		'		repeat with childElement in childElements' \
+		'			try' \
+		'				set elementName to name of childElement as text' \
+		'				set elementRole to role description of childElement as text' \
+		'				if elementName is "Add" and elementRole is "button" then' \
+		'					click childElement' \
+		'					return true' \
+		'				end if' \
+		'			end try' \
+		'			if my clickFirstAdd(childElement) then return true' \
+		'		end repeat' \
+		'	end tell' \
+		'	return false' \
+		'end clickFirstAdd' \
+		'on run argv' \
+		'	set trackUrl to item 1 of argv' \
+		'	set waitSeconds to item 2 of argv as number' \
+		'	tell application "Music"' \
+		'		activate' \
+		'		open location trackUrl' \
+		'	end tell' \
+		'	delay waitSeconds' \
+		'	tell application "System Events"' \
+		'		if UI elements enabled is false then' \
+		'			error "Accessibility permission is required. Enable it for the terminal app running this command in System Settings > Privacy & Security > Accessibility." number 64' \
+		'		end if' \
+		'		tell process "Music"' \
+		'			set frontmost to true' \
+		'			if my clickFirstAdd(window 1) then return "Clicked Music.app Add button"' \
+		'		end tell' \
+		'	end tell' \
+		'	error "Could not find a visible Add button for the opened Apple Music catalog page." number 64' \
+		'end run' \
+		-- "$1" "$2"
+}
+
+wait_for_library_track() {
+	run_applescript "waiting for track in Music library" \
+		'on run argv' \
+		'	set trackName to item 1 of argv' \
+		'	set artistName to item 2 of argv' \
+		'	set albumName to item 3 of argv' \
+		'	set timeoutSeconds to item 4 of argv as integer' \
+		'	repeat with elapsedSeconds from 0 to timeoutSeconds' \
+		'		tell application "Music"' \
+		'			set matchedTracks to every track of playlist "Library" whose name is trackName and artist is artistName and album is albumName' \
+		'			if (count of matchedTracks) > 0 then return count of matchedTracks' \
+		'			set matchedTracks to every track of playlist "Library" whose name is trackName and artist is artistName' \
+		'			if (count of matchedTracks) > 0 then return count of matchedTracks' \
+		'		end tell' \
+		'		delay 1' \
+		'	end repeat' \
+		'	return 0' \
+		'end run' \
+		-- "$1" "$2" "$3" "$4"
+}
+
+duplicate_library_track_to_playlist_by_metadata() {
+	run_applescript "duplicating library track to playlist" \
+		"${playlist_apple_script_helpers[@]}" \
+		'on run argv' \
+		'	set playlistName to item 1 of argv' \
+		'	set trackName to item 2 of argv' \
+		'	set artistName to item 3 of argv' \
+		'	set albumName to item 4 of argv' \
+		'	set playlistRef to my exactly_one_mutable_playlist(playlistName)' \
+		'	tell application "Music"' \
+		'		set matchedTracks to every track of playlist "Library" whose name is trackName and artist is artistName and album is albumName' \
+		'		if (count of matchedTracks) = 0 then set matchedTracks to every track of playlist "Library" whose name is trackName and artist is artistName' \
+		'		if (count of matchedTracks) = 0 then error "Track not found in Library after Music.app Add button click: " & trackName & " by " & artistName number 64' \
+		'		duplicate item 1 of matchedTracks to playlistRef' \
+		'	end tell' \
+		'	return "Added track: " & trackName & " -> " & playlistName' \
+		'end run' \
+		-- "$1" "$2" "$3" "$4"
+}
+
+playlist_add_gui() {
+	local playlist_name="${1:-}"
+	local requested_track_name="${2:-}"
+	local requested_artist_name="${3:-}"
+	local dry_run="false"
+	local manual="false"
+	local selected_track_id=""
+	local wait_seconds="6"
+	local response
+	local match_tsv
+	local track_id
+	local track_name
+	local artist_name
+	local collection_name
+	local track_url
+	local verify_count
+	local library_count
+
+	if wants_help "$@"; then
+		playlist_command_usage "add-gui"
+		return 0
+	fi
+
+	if (( $# < 3 )); then
+		usage_error "playlist add-gui expects at least 3 argument(s), got $#." "playlist:add-gui"
+		return $?
+	fi
+
+	if (( $# > 8 )); then
+		usage_error "playlist add-gui expects at most 8 argument(s), got $#." "playlist:add-gui"
+		return $?
+	fi
+
+	shift 3
+	while (( $# > 0 )); do
+		case "${1}" in
+			--dry-run)
+				dry_run="true"
+				shift
+				;;
+			--manual)
+				manual="true"
+				shift
+				;;
+			--track-id)
+				if (( $# < 2 )); then
+					usage_error "playlist add-gui --track-id requires a value." "playlist:add-gui"
+					return $?
+				fi
+				selected_track_id="${2}"
+				shift 2
+				;;
+			--wait)
+				if (( $# < 2 )); then
+					usage_error "playlist add-gui --wait requires a value." "playlist:add-gui"
+					return $?
+				fi
+				wait_seconds="${2}"
+				shift 2
+				;;
+			*)
+				usage_error "Unknown playlist add-gui option: ${1}" "playlist:add-gui"
+				return $?
+				;;
+		esac
+	done
+
+	require_non_empty_name "playlist:add-gui" "playlist add-gui" "${playlist_name}" || return $?
+	require_non_empty_track_name "playlist:add-gui" "playlist add-gui" "${requested_track_name}" || return $?
+	require_non_empty_artist_name "playlist:add-gui" "playlist add-gui" "${requested_artist_name}" || return $?
+	if [[ -n "${selected_track_id}" && "${selected_track_id}" != <-> ]]; then
+		usage_error "playlist add-gui --track-id must be numeric." "playlist:add-gui"
+		return $?
+	fi
+	if [[ "${wait_seconds}" != <-> ]]; then
+		usage_error "playlist add-gui --wait must be a non-negative integer." "playlist:add-gui"
+		return $?
+	fi
+
+	ensure_mutable_playlist "${playlist_name}" || return $?
+	response="$(catalog_search_response "${requested_track_name}" "${requested_artist_name}")" || return $?
+	match_tsv="$(catalog_match_tsv "${requested_track_name}" "${requested_artist_name}" "${response}" "${selected_track_id}")" || return $?
+	IFS=$'\t' read -r track_id track_name artist_name collection_name track_url <<< "${match_tsv}"
+
+	if [[ "${dry_run}" == "true" ]]; then
+		printf '%s\n' "Catalog match: ${track_name} by ${artist_name} | ${collection_name} | id:${track_id}"
+		printf '%s\n' "Would open in Music.app, click Add to save it to Library, then add it to playlist: ${playlist_name}"
+		printf '%s\n' "${track_url}"
+		return 0
+	fi
+
+	if [[ "${manual}" == "true" ]]; then
+		copy_to_clipboard "${track_url}"
+		open_catalog_track_in_music "${track_url}" || return $?
+		printf '%s\n' "Opened catalog track in Music.app: ${track_name} by ${artist_name}"
+		printf '%s\n' "Target playlist: ${playlist_name}"
+		printf '%s\n' "Track URL copied to clipboard."
+		printf '%s\n' "In Music.app, use the song's More menu or Song > Add to Playlist, then choose ${playlist_name}."
+		return 0
+	fi
+
+	library_count="$(wait_for_library_track "${track_name}" "${artist_name}" "${collection_name}" 0)" || return $?
+	if (( library_count == 0 )); then
+		click_music_add_button "${track_url}" "${wait_seconds}" || return $?
+		library_count="$(wait_for_library_track "${track_name}" "${artist_name}" "${collection_name}" 20)" || return $?
+		if (( library_count == 0 )); then
+			print_error "Clicked Music.app Add button, but ${track_name} by ${artist_name} did not appear in Library."
+			return "${EX_SOFTWARE}"
+		fi
+	fi
+	duplicate_library_track_to_playlist_by_metadata "${playlist_name}" "${track_name}" "${artist_name}" "${collection_name}" >/dev/null || return $?
+	verify_count="$(verify_playlist_track_name "${playlist_name}" "${track_name}")" || return $?
+	if (( verify_count > 0 )); then
+		printf '%s\n' "Added catalog track through Music.app UI: ${track_name} by ${artist_name} -> ${playlist_name}"
+	else
+		print_error "Music.app UI automation completed, but the track was not found in the target playlist."
+		return "${EX_SOFTWARE}"
+	fi
+}
+
 playlist_remove() {
 	if wants_help "$@"; then
 		playlist_command_usage "remove"
@@ -870,6 +1126,10 @@ playlist() {
 		add-catalog|add-streaming)
 			shift
 			playlist_add_catalog "$@"
+			;;
+		add-gui)
+			shift
+			playlist_add_gui "$@"
 			;;
 		search)
 			shift

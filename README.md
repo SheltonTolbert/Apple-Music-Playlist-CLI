@@ -22,6 +22,8 @@ zsh src/am.sh playlist add "Playlist Name" "Track Name"
 zsh src/am.sh playlist search "Track Name" "Artist Name"
 zsh src/am.sh playlist add-catalog "Playlist Name" "Track Name" "Artist Name"
 zsh src/am.sh playlist add-catalog "Playlist Name" "Track Name" "Artist Name" --track-id 12345
+zsh src/am.sh playlist add-gui "Playlist Name" "Track Name" "Artist Name"
+zsh src/am.sh playlist add-gui "Playlist Name" "Track Name" "Artist Name" --track-id 12345 --manual
 zsh src/am.sh playlist remove "Playlist Name" "Track Name" --force
 zsh src/am.sh playlist clear "Playlist Name" --force
 ```
@@ -36,6 +38,8 @@ zsh src/am.sh playlist clear "Playlist Name" --force
 - `search` searches Apple Music catalog matches and prints catalog track IDs.
 - `add-catalog` searches the Apple Music catalog and adds a matching catalog
   song to a cloud library playlist through the Apple Music API.
+- `add-gui` searches the Apple Music catalog, opens the matching song in
+  Music.app, and attempts to add it through Music.app UI automation.
 - `remove --force` removes matching track entries from the target playlist.
 - `clear --force` removes all tracks from the target playlist.
 
@@ -81,12 +85,47 @@ The catalog write path targets cloud library playlists visible to the Apple
 Music API. A playlist that exists only locally in Music.app may need Sync Library
 enabled before the API can find it by name.
 
+## No-Token GUI Fallback
+
+`playlist add-gui` is an experimental no-developer-token fallback. It still uses
+the public catalog search to find the song URL, but the write happens through the
+visible Music.app UI rather than through Apple's API:
+
+```sh
+zsh src/am.sh playlist add-gui "Playlist Name" "Numb" "Linkin Park" --track-id 528437514
+```
+
+This command requires Accessibility permission for the terminal app running the
+script. Grant it in System Settings > Privacy & Security > Accessibility. It
+then opens the selected Apple Music URL, clicks Music.app's visible Add button
+to save the song to the local Library, waits for it to appear in
+`playlist "Library"`, and finally duplicates that Library track into the target
+playlist.
+
+If the menu automation is blocked by permissions or a Music.app UI change, use
+manual mode:
+
+```sh
+zsh src/am.sh playlist add-gui "Playlist Name" "Numb" "Linkin Park" --track-id 528437514 --manual
+```
+
+Manual mode opens the catalog track in Music.app, copies the URL to the
+clipboard, and prints the target playlist so you can choose Add to Playlist in
+Music.app yourself.
+
+The automated GUI fallback intentionally adds the song to your Library first.
+That is the tradeoff that makes the no-developer-token path scriptable after the
+UI click.
+
 ## Constraints
 
 - This tool automates Music.app through AppleScript, so macOS must allow the
   terminal running the command to control Music.app. If prompted, grant
   automation permission in System Settings.
 - Catalog search and catalog playlist writes require `curl` and `jq`.
+- `add-gui` requires `curl`, `jq`, Music.app, and Accessibility permission for
+  automated mode. It is intentionally best-effort because Music.app UI labels and
+  selection behavior can change across macOS releases.
 - Playlist and track names are exact matches. Quote names that contain spaces or
   shell-significant characters.
 - `add` searches `playlist "Library"` by exact track name. It errors when no
