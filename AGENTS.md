@@ -85,7 +85,19 @@ Do not print token values in logs.
    zsh src/am.sh playlist show "Playlist Name"
    ```
 
-8. Run the bulk import through a resumable script that logs every row. Recommended log statuses are `added`, `already_present`, `missing`, `excluded`, and `error`. Keep logs outside commits unless they are intentional fixtures.
+8. Run the bulk import through the reusable importer so the workflow is resumable and logs every row.
+
+   ```sh
+   python3 scripts/import_playlist.py songs.csv "Playlist Name" \
+     --mode add-gui \
+     --exclude-artist U2 \
+     --exclude-artist Coldplay \
+     --track-id-map track-ids.json \
+     --output-dir runs/my-playlist-import \
+     --wait 3
+   ```
+
+   Recommended statuses are produced in `runs/my-playlist-import/status.tsv`: `added`, `already_present`, `skipped_existing`, `excluded`, `missing_data`, `dry_run`, and `error`. Use `--dry-run` first when validating CSV columns or command generation.
 
 9. Verify the final playlist count with Music.app, not only with script output.
 
@@ -120,7 +132,7 @@ The successful fallback path was:
 
 ## Agent hygiene
 
-- Keep generated import scripts and logs untracked unless the user explicitly wants them preserved.
+- Keep generated import logs under `runs/`; reusable import code belongs in `scripts/` and should have tests under `tests/`.
 - Do not commit credentials, tokens, MusicKit user tokens, or raw environment dumps.
 - Use `--dry-run` and one-song smoke tests before bulk mutation.
 - Verify final state with `playlist show` and report both source-row counts and actual playlist counts.

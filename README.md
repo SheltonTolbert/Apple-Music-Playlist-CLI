@@ -85,6 +85,46 @@ The catalog write path targets cloud library playlists visible to the Apple
 Music API. A playlist that exists only locally in Music.app may need Sync Library
 enabled before the API can find it by name.
 
+## CSV Playlist Imports
+
+Use the reusable importer for larger song lists instead of writing one-off
+scripts in the repository root:
+
+```sh
+python3 scripts/import_playlist.py songs.csv "Playlist Name" \
+  --mode add-gui \
+  --exclude-artist U2 \
+  --exclude-artist Coldplay \
+  --track-id-map track-ids.json \
+  --output-dir runs/my-playlist-import \
+  --wait 3
+```
+
+The importer detects common title/artist columns such as `Song` and `Artist`,
+appends a resumable `status.tsv` log under the selected output directory, skips
+rows that already have a successful prior status, and continues after per-track
+errors. Use `--dry-run` to verify the generated CLI commands before mutating
+Music.app.
+
+Track ID maps can be JSON:
+
+```json
+{
+  "Na Na Na|My Chemical Romance": "399999999"
+}
+```
+
+or CSV with title, artist, and track ID columns. Use track IDs when catalog
+search finds the wrong release or a title variant.
+
+Import run output belongs under `runs/`, which is intentionally gitignored.
+Reusable workflow code belongs under `scripts/` and should be tested before
+committing:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
 ## No-Token GUI Fallback
 
 `playlist add-gui` is an experimental no-developer-token fallback. It still uses
